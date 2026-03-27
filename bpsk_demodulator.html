@@ -391,6 +391,28 @@
     border-radius: 2px;
     margin-left: 6px;
   }
+
+  .fec-info {
+    background: rgba(0,255,157,0.03);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 8px 10px;
+    margin-bottom: 10px;
+    min-height: 32px;
+  }
+  .fec-badge {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 2px;
+    font-size: 9px;
+    letter-spacing: 1px;
+    margin-right: 5px;
+    margin-bottom: 2px;
+  }
+  .fec-badge.r { background: rgba(255,204,0,0.15);  color: var(--warn);    border: 1px solid var(--warn); }
+  .fec-badge.g { background: rgba(0,255,157,0.12);  color: var(--accent);  border: 1px solid var(--accent); }
+  .fec-badge.b { background: rgba(0,184,255,0.12);  color: var(--accent2); border: 1px solid var(--accent2); }
+  .fec-badge.e { background: rgba(255,68,85,0.12);  color: #ff4455;        border: 1px solid #ff4455; }
 </style>
 </head>
 <body>
@@ -502,6 +524,31 @@
 
     <button class="btn" id="autoBtn">⟳ AUTO-DETECT PARAMS</button>
     <button class="btn" id="demodBtn" disabled>▶ DEMODULATE</button>
+
+    <hr class="divider">
+    <div class="panel-title">// ERROR CORRECTION (FEC)</div>
+
+    <div class="ctrl-group">
+      <div class="ctrl-label">DECODER</div>
+      <select id="fecMode">
+        <option value="none" selected>None</option>
+        <option value="rep3">Repetition ×3</option>
+        <option value="hamming74">Hamming (7,4)</option>
+        <option value="crc8">CRC-8 framing</option>
+      </select>
+    </div>
+
+    <div class="fec-info" id="fecInfo">
+      <span id="fecDesc" style="color:var(--dim);font-size:10px">No FEC — raw bytes passed through</span>
+    </div>
+
+    <div class="metrics" style="margin-bottom:0" id="fecMetrics">
+      <div class="metric"><div class="metric-val" id="mFecIn">—</div><div class="metric-lbl">IN BYTES</div></div>
+      <div class="metric blue"><div class="metric-val" id="mFecOut">—</div><div class="metric-lbl">OUT BYTES</div></div>
+      <div class="metric orange"><div class="metric-val" id="mFecFixed">—</div><div class="metric-lbl">CORRECTED</div></div>
+      <div class="metric yellow"><div class="metric-val" id="mFecBad">—</div><div class="metric-lbl">BAD FRAMES</div></div>
+    </div>
+
     <button class="btn secondary" id="copyBtn" disabled>⊡ COPY OUTPUT</button>
   </div>
 
@@ -960,6 +1007,17 @@ function demodulate() {
   document.getElementById('byteCount').textContent = bytes.length + ' bytes';
 
   log(`Decoded ${bytes.length} bytes | ${errors} framing errors | ${pct}% printable`, 'ok');
+
+  // Step 6: FEC decode
+  const fecResult = fecDecode(decodedBytes);
+  decodedBytes = fecResult.bytes;
+  document.getElementById('mFecIn').textContent   = bytes.length;
+  document.getElementById('mFecOut').textContent  = fecResult.bytes.length;
+  document.getElementById('mFecFixed').textContent = fecResult.corrected;
+  document.getElementById('mFecBad').textContent  = fecResult.bad;
+  if (fecResult.mode !== 'none')
+    log(`FEC [${fecResult.mode}]: ${bytes.length}B → ${fecResult.bytes.length}B | corrected=${fecResult.corrected} bad=${fecResult.bad}`, 'ok');
+
   progress.style.width = '100%';
   setTimeout(() => { progress.style.width = '0%'; }, 800);
 
@@ -968,6 +1026,146 @@ function demodulate() {
 
   renderOutput();
 }
+
+// ── FEC Decoders ──────────────────────────────────────────────────────────────
+
+// Repetition ×3 decode: unpack bits, majority vote each group of 3, repack
+function fecRep3Decode(bytes) {
+  // Unpack all bits
+  const bits = [];
+  for (const b of bytes)
+    for (let k = 7; k >= 0; k--) bits.push((b >> k) & 1);
+
+  let corrected = 0;
+  const outBits = [];
+  // Process in groups of 24 (= 8 data bits × 3)
+  for (let i = 0; i + 2 < bits.length; i += 3) {
+    const sum = bits[i] + bits[i+1] + bits[i+2];
+    const voted = sum >= 2 ? 1 : 0;
+    // Count as corrected if not all three agree
+    if (bits[i] !== bits[i+1] || bits[i+1] !== bits[i+2]) corrected++;
+    outBits.push(voted);
+  }
+  // Repack to bytes
+  const out = [];
+  for (let i = 0; i + 7 < outBits.length; i += 8) {
+    let v = 0;
+    for (let j = 0; j < 8; j++) v |= outBits[i+j] << (7-j);
+    out.push(v);
+  }
+  return { bytes: new Uint8Array(out), corrected, bad: 0 };
+}
+
+// Hamming (7,4) decode: correct single-bit errors per codeword
+function hamming74Decode(cw7) {
+  // cw7 = 7-bit codeword: p1 p2 d0 p3 d1 d2 d3
+  const b = (i) => (cw7 >> (6-i)) & 1;
+  const s1 = b(0)^b(2)^b(4)^b(6);
+  const s2 = b(1)^b(2)^b(5)^b(6);
+  const s3 = b(3)^b(4)^b(5)^b(6);
+  const syndrome = (s3 << 2) | (s2 << 1) | s1;
+  let corrected = cw7;
+  let fixed = 0;
+  if (syndrome !== 0) {
+    // Syndrome gives 1-based bit position (bit 7 = MSB = pos 1)
+    const errBit = syndrome - 1; // 0-indexed from MSB
+    corrected ^= (1 << (6 - errBit));
+    fixed = 1;
+  }
+  // Extract data bits: positions 2,4,5,6 (0-indexed)
+  const d0 = (corrected >> 4) & 1;
+  const d1 = (corrected >> 2) & 1;
+  const d2 = (corrected >> 1) & 1;
+  const d3 = corrected & 1;
+  return { nibble: (d0<<3)|(d1<<2)|(d2<<1)|d3, fixed };
+}
+
+function fecHamming74Decode(bytes) {
+  // Unpack all bits
+  const bits = [];
+  for (const b of bytes)
+    for (let k = 7; k >= 0; k--) bits.push((b >> k) & 1);
+
+  let corrected = 0;
+  const out = [];
+  // Each input byte → 14 bits → 2× 7-bit codewords → 2× nibbles → 1 output byte
+  for (let i = 0; i + 13 < bits.length; i += 14) {
+    let cw1 = 0, cw2 = 0;
+    for (let k = 0; k < 7; k++) cw1 |= bits[i+k]   << (6-k);
+    for (let k = 0; k < 7; k++) cw2 |= bits[i+7+k] << (6-k);
+    const r1 = hamming74Decode(cw1);
+    const r2 = hamming74Decode(cw2);
+    corrected += r1.fixed + r2.fixed;
+    out.push((r1.nibble << 4) | r2.nibble);
+  }
+  return { bytes: new Uint8Array(out), corrected, bad: 0 };
+}
+
+// CRC-8 frame decode: find sync 0xAA, validate CRC, extract payload
+function crc8Calc(bytes) {
+  let crc = 0;
+  for (const b of bytes) {
+    crc ^= b;
+    for (let i = 0; i < 8; i++)
+      crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) & 0xFF : (crc << 1) & 0xFF;
+  }
+  return crc;
+}
+
+function fecCrc8Decode(bytes) {
+  const out = [];
+  let bad = 0, good = 0;
+  let i = 0;
+  while (i < bytes.length - 2) {
+    if (bytes[i] === 0xAA) { // sync
+      const len = bytes[i+1];
+      if (len > 0 && i + 2 + len < bytes.length) {
+        const payload = bytes.slice(i+2, i+2+len);
+        const rxCrc   = bytes[i+2+len];
+        const calcCrc = crc8Calc(payload);
+        if (rxCrc === calcCrc) {
+          for (const b of payload) out.push(b);
+          good++;
+          i += 2 + len + 1;
+          continue;
+        } else {
+          bad++;
+        }
+      }
+    }
+    i++;
+  }
+  return { bytes: new Uint8Array(out), corrected: good, bad };
+}
+
+function fecDecode(bytes) {
+  const mode = document.getElementById('fecMode').value;
+  if (mode === 'rep3')      return { mode, ...fecRep3Decode(bytes) };
+  if (mode === 'hamming74') return { mode, ...fecHamming74Decode(bytes) };
+  if (mode === 'crc8')      return { mode, ...fecCrc8Decode(bytes) };
+  return { mode: 'none', bytes, corrected: 0, bad: 0 };
+}
+
+// ── FEC UI ────────────────────────────────────────────────────────────────────
+const FEC_DESCRIPTIONS = {
+  none:       '<span class="fec-badge b">OFF</span><span style="color:var(--dim);font-size:10px">No FEC — raw UART bytes output</span>',
+  rep3:       '<span class="fec-badge r">×3 REPETITION</span><span style="color:var(--dim);font-size:10px">Majority vote per 3-bit group. Corrects 1 error per triplet. Input must be ×3 encoded.</span>',
+  hamming74:  '<span class="fec-badge g">HAMMING 7,4</span><span style="color:var(--dim);font-size:10px">Corrects single-bit errors per 7-bit codeword. Each input byte → nibble pair.</span>',
+  crc8:       '<span class="fec-badge b">CRC-8 FRAME</span><span style="color:var(--dim);font-size:10px">Finds 0xAA sync, validates CRC-8(0x07). Discards corrupt frames, counts bad.</span>',
+};
+
+function updateFecInfo() {
+  const mode = document.getElementById('fecMode').value;
+  document.getElementById('fecInfo').innerHTML =
+    '<span id="fecDesc">' + (FEC_DESCRIPTIONS[mode] || FEC_DESCRIPTIONS.none) + '</span>';
+  // Reset FEC metrics when mode changes
+  ['mFecIn','mFecOut','mFecFixed','mFecBad'].forEach(id => {
+    document.getElementById(id).textContent = '—';
+  });
+}
+
+document.getElementById('fecMode').addEventListener('change', updateFecInfo);
+updateFecInfo();
 
 // ── Output rendering ──────────────────────────────────────────────────────────
 function renderOutput() {
